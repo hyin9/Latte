@@ -7,15 +7,26 @@
 A minimal training script for Latte using PyTorch DDP.
 """
 
+import os
+
+# default config for autocast, must be set before importing torch
+if "PT_HPU_AUTOCAST_LOWER_PRECISION_OPS_LIST" not in os.environ:
+    os.environ['PT_HPU_AUTOCAST_LOWER_PRECISION_OPS_LIST'] = os.path.dirname(__file__) + "/../ops_bf16.txt"
+if "PT_HPU_AUTOCAST_FP32_OPS_LIST" not in os.environ:
+    os.environ['PT_HPU_AUTOCAST_FP32_OPS_LIST'] = os.path.dirname(__file__) + "/../ops_fp32.txt"
+#if "HABANA_PROFILE" not in os.environ:
+#    os.environ['HABANA_PROFILE'] = str(1)
+print(f"habana_profile={os.environ.get('HABANA_PROFILE', '0')}")
 
 import torch
 # Maybe use fp16 percision training need to set to False
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+#torch.backends.cuda.matmul.allow_tf32 = True
+#torch.backends.cudnn.allow_tf32 = True
 
-import os
+#import os
 import math
 import argparse
+import logging
 
 import torch.distributed as dist
 from glob import glob
@@ -35,28 +46,53 @@ from torch.utils.data.distributed import DistributedSampler
 from utils import (clip_grad_norm_, create_logger, update_ema, 
                    requires_grad, cleanup, create_tensorboard, 
                    write_tensorboard, setup_distributed, get_experiment_dir)
+import habana_frameworks.torch.core as htcore
+
+activities = [torch.profiler.ProfilerActivity.CPU]
+
+logger = logging.getLogger(__name__)
 
 
+ 
+                
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
 def main(args):
 
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    #assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
-    setup_distributed()
+    #setup_distributed()
+    
+    # dist.init_process_group("nccl")
+    # assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    # rank = dist.get_rank()
+    # device = rank % torch.cuda.device_count()
+    # local_rank = rank
 
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device = torch.device("cuda", local_rank)
+    
+    #device = torch.device("cuda", local_rank)
 
+    #seed = args.global_seed + rank
+    #torch.manual_seed(seed)
+    #torch.cuda.set_device(device)
+    #device = torch.device("hpu")
+    #logger.info("**************  setting device to be HPU !")
+    activities.append(torch.profiler.ProfilerActivity.HPU)
+
+    device = torch.device('hpu')
+
+    from habana_frameworks.torch.distributed.hccl import initialize_distributed_hpu
+    world_size, rank, local_rank = initialize_distributed_hpu()
+    print(f"Starting rank={rank}, local rank={local_rank}, world_size={world_size}.")
+
+    torch.distributed.init_process_group(backend='hccl', rank=rank, world_size=world_size)
+    print(f"setup:Starting rank={rank}, local rank={local_rank},  world_size={dist.get_world_size()}.")
+    
     seed = args.global_seed + rank
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, local rank={local_rank}, seed={seed}, world_size={dist.get_world_size()}.")
-
+    
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -187,7 +223,7 @@ def main(args):
     num_update_steps_per_epoch = math.ceil(len(loader))
     # Afterwards we recalculate our number of training epochs
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
+    print(f"num_train_epochs={num_train_epochs}, args.max_train_steps={args.max_train_steps}, num_update_steps_per_epoch={num_update_steps_per_epoch}.")
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         # TODO, need to checkout
@@ -202,93 +238,102 @@ def main(args):
 
         first_epoch = train_steps // num_update_steps_per_epoch
         resume_step = train_steps % num_update_steps_per_epoch
+    
+    with torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=0, warmup=20, active=5, repeat=1),
+        activities=activities,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('logs')) as profiler:
 
-    for epoch in range(first_epoch, num_train_epochs):
-        sampler.set_epoch(epoch)
-        for step, video_data in enumerate(loader):
-            # Skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                continue
+        for epoch in range(first_epoch, num_train_epochs):
+            sampler.set_epoch(epoch)
+            for step, video_data in enumerate(loader):
+                # Skip steps until we reach the resumed step
+                if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                    continue
 
-            x = video_data['video'].to(device, non_blocking=True)
-            video_name = video_data['video_name']
-            if args.dataset == "ucf101_img":
-                image_name = video_data['image_name']
-                image_names = []
-                for caption in image_name:
-                    single_caption = [int(item) for item in caption.split('=====')]
-                    image_names.append(torch.as_tensor(single_caption))
+                x = video_data['video'].to(device, non_blocking=True)
+                video_name = video_data['video_name']
+                if args.dataset == "ucf101_img":
+                    image_name = video_data['image_name']
+                    image_names = []
+                    for caption in image_name:
+                        single_caption = [int(item) for item in caption.split('=====')]
+                        image_names.append(torch.as_tensor(single_caption))
             # x = x.to(device)
             # y = y.to(device) # y is text prompt; no need put in gpu
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                b, _, _, _, _ = x.shape
-                x = rearrange(x, 'b f c h w -> (b f) c h w').contiguous()
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-                x = rearrange(x, '(b f) c h w -> b f c h w', b=b).contiguous()
+                with torch.no_grad():
+                    # Map input images to latent space + normalize latents:
+                    b, _, _, _, _ = x.shape
+                    x = rearrange(x, 'b f c h w -> (b f) c h w').contiguous()
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                    x = rearrange(x, '(b f) c h w -> b f c h w', b=b).contiguous()
 
-            if args.extras == 78: # text-to-video
-                raise 'T2V training are Not supported at this moment!'
-            elif args.extras == 2:
-                if args.dataset == "ucf101_img":
-                    model_kwargs = dict(y=video_name, y_image=image_names, use_image_num=args.use_image_num) # tav unet
+                if args.extras == 78: # text-to-video
+                    raise 'T2V training are Not supported at this moment!'
+                elif args.extras == 2:
+                    if args.dataset == "ucf101_img":
+                        model_kwargs = dict(y=video_name, y_image=image_names, use_image_num=args.use_image_num) # tav unet
+                    else:
+                        model_kwargs = dict(y=video_name) # tav unet
                 else:
-                    model_kwargs = dict(y=video_name) # tav unet
-            else:
-                model_kwargs = dict(y=None, use_image_num=args.use_image_num)
+                    model_kwargs = dict(y=None, use_image_num=args.use_image_num)
+                
+                with torch.autocast(device_type="hpu", dtype=torch.bfloat16):
+                    t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+                    loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                    loss = loss_dict["loss"].mean()
+                    
+                loss.backward()
 
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean() / args.gradient_accumulation_steps
-            loss.backward()
+                if train_steps < args.start_clip_iter: # if train_steps >= start_clip_iter, will clip gradient
+                    gradient_norm = clip_grad_norm_(model.module.parameters(), args.clip_max_norm, clip_grad=False)
+                else:
+                    gradient_norm = clip_grad_norm_(model.module.parameters(), args.clip_max_norm, clip_grad=True)
 
-            if train_steps < args.start_clip_iter: # if train_steps >= start_clip_iter, will clip gradient
-                gradient_norm = clip_grad_norm_(model.module.parameters(), args.clip_max_norm, clip_grad=False)
-            else:
-                gradient_norm = clip_grad_norm_(model.module.parameters(), args.clip_max_norm, clip_grad=True)
-
-            lr_scheduler.step()
-            if train_steps % args.gradient_accumulation_steps == 0 and train_steps > 0:
                 opt.step()
+                htcore.mark_step() #Add
+                profiler.step()
+
+                lr_scheduler.step()
                 opt.zero_grad()
                 update_ema(ema, model.module)
 
-            # Log loss values:
-            running_loss += loss.item()
-            log_steps += 1
-            train_steps += 1
-            if train_steps % args.log_every == 0:
-                # Measure training speed:
-                torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
+                # Log loss values:
+                running_loss += loss.item()
+                log_steps += 1
+                train_steps += 1
+                if train_steps % args.log_every == 0:
+                    # Measure training speed:
+                    #torch.cuda.synchronize()
+                    end_time = time()
+                    steps_per_sec = log_steps / (end_time - start_time)
+                    # Reduce loss history over all processes:
+                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / dist.get_world_size()
                 # logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                logger.info(f"(step={train_steps:07d}/epoch={epoch:04d}) Train Loss: {avg_loss:.4f}, Gradient Norm: {gradient_norm:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                write_tensorboard(tb_writer, 'Train Loss', avg_loss, train_steps)
-                write_tensorboard(tb_writer, 'Gradient Norm', gradient_norm, train_steps)
-                # Reset monitoring variables:
-                running_loss = 0
-                log_steps = 0
-                start_time = time()
+                    logger.info(f"(step={train_steps:07d}/epoch={epoch:04d}) Train Loss: {avg_loss:.4f}, Gradient Norm: {gradient_norm:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                    write_tensorboard(tb_writer, 'Train Loss', avg_loss, train_steps)
+                    write_tensorboard(tb_writer, 'Gradient Norm', gradient_norm, train_steps)
+                    # Reset monitoring variables:
+                    running_loss = 0
+                    log_steps = 0
+                    start_time = time()
 
             # Save Latte checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        # "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
+                if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                    if rank == 0:
+                        checkpoint = {
+                            # "model": model.module.state_dict(),
+                            "ema": ema.state_dict(),
                         # "opt": opt.state_dict(),
                         # "args": args
-                    }
+                        }  
 
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+                        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                        torch.save(checkpoint, checkpoint_path)
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -300,6 +345,6 @@ def main(args):
 if __name__ == "__main__":
     # Default args here will train Latte-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="./configs/sky/sky_train.yaml")
+    parser.add_argument("--config", type=str, default="./configs/tuneavideo.yaml")
     args = parser.parse_args()
     main(OmegaConf.load(args.config))
