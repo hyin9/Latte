@@ -152,6 +152,13 @@ or
 python train_with_img_pl.py --config ./configs/ffs/ffs_img_train.yaml
 ```
 
+#Run in Gaudi2 1 card
+torchrun --nnodes=1 --nproc_per_node=1 train_with_img.py --config ./configs/ffs/ffs_img_train.yaml
+
+#Run in Gaudi2 8 card
+torchrun --nnodes=1 --nproc_per_node=8 --world_size 8 train_with_img.py --config ./configs/ffs/ffs_img_train.yaml
+
+
 This script automatically detects available GPUs and uses distributed training.
 
 ## Contact Us
